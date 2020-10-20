@@ -21,6 +21,13 @@ use panic_semihosting as _;
 
 #[rtic::app(device = lm3s6965)]
 mod app {
+    #[resources]
+    struct Resources {
+        // A resource
+        #[init(0)]
+        counter: u32,
+    }
+
     #[init]
     fn init(_c: init::Context) -> init::LateResources {
         foo::spawn(true).unwrap();
@@ -29,19 +36,20 @@ mod app {
         init::LateResources {}
     }
 
-    #[task]
-    fn foo(_c: foo::Context, spawn: bool) {
+    #[task(resources = [counter])]
+    fn foo(c: foo::Context, spawn: bool) {
         // BEGIN BOILERPLATE
         type F = impl Future + 'static;
-        fn create() -> F {
-            task()
+        fn create(c: foo::Context<'static>) -> F {
+            task(c)
         }
 
         static mut TASK: Task<F> = Task::new();
 
         unsafe {
             if spawn {
-                TASK.spawn(create);
+                // TODO I have no idea if this transmute is actually OK
+                TASK.spawn(|| create(mem::transmute(c)));
             }
             TASK.poll(|| {
                 // it's OK if the task fails to spawn because it's already queued.
@@ -51,27 +59,29 @@ mod app {
         }
         // END BOILERPLATE
 
-        async fn task() {
+        async fn task(c: foo::Context<'static>) {
             loop {
-                hprintln!("foo");
+                *c.resources.counter += 1;
+                hprintln!("foo {}", *c.resources.counter);
                 please_yield().await;
             }
         }
     }
 
-    #[task]
-    fn bar(_c: bar::Context, spawn: bool) {
+    #[task(resources = [counter])]
+    fn bar(c: bar::Context, spawn: bool) {
         // BEGIN BOILERPLATE
         type F = impl Future + 'static;
-        fn create() -> F {
-            task()
+        fn create(c: bar::Context<'static>) -> F {
+            task(c)
         }
 
         static mut TASK: Task<F> = Task::new();
 
         unsafe {
             if spawn {
-                TASK.spawn(create);
+                // TODO I have no idea if this transmute is actually OK
+                TASK.spawn(|| create(mem::transmute(c)));
             }
             TASK.poll(|| {
                 // it's OK if the task fails to spawn because it's already queued.
@@ -81,9 +91,10 @@ mod app {
         }
         // END BOILERPLATE
 
-        async fn task() {
+        async fn task(c: bar::Context<'static>) {
             loop {
-                hprintln!("bar");
+                *c.resources.counter += 1;
+                hprintln!("bar {}", *c.resources.counter);
                 please_yield().await;
             }
         }
