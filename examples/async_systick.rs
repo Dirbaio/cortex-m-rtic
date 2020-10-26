@@ -17,6 +17,18 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use cortex_m_semihosting::{debug, hprintln};
 use panic_semihosting as _;
+use rtic::Mutex;
+
+pub enum State {
+    Started,
+    Done,
+}
+
+pub struct Systick {
+    syst: cortex_m::peripheral::SYST,
+    state: State,
+    waker: Option<Waker>,
+}
 
 #[rtic::app(device = lm3s6965, dispatchers = [SSI0], peripherals = true)]
 mod app {
@@ -25,14 +37,20 @@ mod app {
 
     #[resources]
     struct Resources {
-        syst: cortex_m::peripheral::SYST,
+        systick: Systick,
     }
 
     #[init]
     fn init(cx: init::Context) -> init::LateResources {
         hprintln!("init").unwrap();
         foo::spawn().unwrap();
-        init::LateResources { syst: cx.core.SYST }
+        init::LateResources {
+            systick: Systick {
+                syst: cx.core.SYST,
+                state: State::Done,
+                waker: None,
+            },
+        }
     }
 
     #[idle]
@@ -44,7 +62,7 @@ mod app {
         }
     }
 
-    #[task(resources = [syst])]
+    #[task(resources = [systick])]
     fn foo(mut cx: foo::Context) {
         // BEGIN BOILERPLATE
         type F = impl Future + 'static;
@@ -65,7 +83,9 @@ mod app {
             };
 
             hprintln!("foo trampoline poll").ok();
-            TASK.poll(|| {});
+            TASK.poll(|| {
+                let _ = foo::spawn();
+            });
 
             match TASK {
                 Task::Done(ref r) => {
@@ -83,17 +103,11 @@ mod app {
             hprintln!("foo task").ok();
 
             hprintln!("delay long time").ok();
-            let fut = cx.resources.syst.lock(|syst| timer_delay(syst, 5000000));
-
-            hprintln!("we have just created the future");
-            fut.await; // this calls poll on the timer future
+            timer_delay(&mut cx.resources.systick, 5000000).await;
             hprintln!("foo task resumed").ok();
 
             hprintln!("delay short time").ok();
-            cx.resources
-                .syst
-                .lock(|syst| timer_delay(syst, 1000000))
-                .await;
+            timer_delay(&mut cx.resources.systick, 1000000).await;
             hprintln!("foo task resumed").ok();
         }
     }
@@ -143,11 +157,14 @@ mod app {
     // }
 
     // This the actual RTIC task, binds to systic.
-    #[task(binds = SysTick, resources = [syst], priority = 2)]
+    #[task(binds = SysTick, resources = [systick], priority = 2)]
     fn systic(mut cx: systic::Context) {
         hprintln!("systic interrupt").ok();
-        cx.resources.syst.lock(|syst| syst.disable_interrupt());
-        crate::app::foo::spawn(); // this should be from a Queue later
+        cx.resources.systick.lock(|s| {
+            s.syst.disable_interrupt();
+            s.state = State::Done;
+            s.waker.take().map(|w| w.wake());
+        });
     }
 }
 
@@ -211,35 +228,45 @@ impl<F: Future + 'static> Task<F> {
 // Timer
 // Later we want a proper queue
 
-use heapless;
-pub struct Timer {
-    pub done: bool,
-    // pub waker_task: Option<fn() -> Result<(), ()>>,
+pub struct Timer<'a, T: Mutex<T = Systick>> {
+    started: bool,
+    t: u32,
+    systick: &'a mut T,
 }
 
-impl Future for Timer {
+impl<'a, T: Mutex<T = Systick>> Future for Timer<'a, T> {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.done {
-            Poll::Ready(())
-        } else {
-            hprintln!("timer polled");
-            cx.waker().wake_by_ref();
-            hprintln!("after wake_by_ref");
-            self.done = true;
-            Poll::Pending
-        }
+        let Self {
+            started,
+            t,
+            systick,
+        } = &mut *self;
+        systick.lock(|s| {
+            if !*started {
+                s.syst.set_reload(*t);
+                s.syst.enable_counter();
+                s.syst.enable_interrupt();
+                s.state = State::Started;
+                *started = true;
+            }
+
+            match s.state {
+                State::Done => Poll::Ready(()),
+                State::Started => {
+                    s.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
     }
 }
 
-fn timer_delay(syst: &mut cortex_m::peripheral::SYST, t: u32) -> Timer {
+fn timer_delay<'a, T: Mutex<T = Systick>>(systick: &'a mut T, t: u32) -> Timer<'a, T> {
     hprintln!("timer_delay {}", t);
-
-    syst.set_reload(t);
-    syst.enable_counter();
-    syst.enable_interrupt();
     Timer {
-        done: false,
-        // waker_task: Some(app::foo::spawn), // we should add waker field to async task context i RTIC
+        started: false,
+        t,
+        systick,
     }
 }
